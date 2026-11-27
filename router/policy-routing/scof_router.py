@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""SCOF policy router: resolves a deployment (jurisdiction, sector) to a deployment context.
+
+The context name selects the region allow-list in region_allowlists.json and is the value
+the Rego library reads from data.context. The router fails closed: an empty,
+unknown or ambiguous deployment raises RouterError and no context is returned.
+
+Usage:
+  python router/policy-routing/scof_router.py --jurisdiction india --sector finance
+  python router/policy-routing/scof_router.py --jurisdiction eu
+  python router/policy-routing/scof_router.py --list
+Add --write to also (re)generate contexts/<context>.json.
+Exit codes: 0 resolved, 2 router error.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+ROUTER_DIR = Path(__file__).resolve().parent
+ROUTES_FILE = ROUTER_DIR / "routing.json"
+KNOWN_CONTEXTS_FILE = ROUTER_DIR / "known_contexts.json"
+CONTROL_SETS_FILE = ROUTER_DIR / "control_sets.json"
+CONTEXT_DIR = ROUTER_DIR / "contexts"
+
+
+class RouterError(Exception):
+    """Routing could not be completed. Never a policy verdict."""
+
+
+def _norm(value):
+    return (value or "").strip().lower()
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RouterError("cannot read " + Path(path).name + " (" + str(exc) + ")") from exc
+
+
+def known_contexts(known_file=KNOWN_CONTEXTS_FILE):
+    data = _read_json(known_file)
+    known = data.get("known_contexts") if isinstance(data, dict) else None
+    if not known:
+        raise RouterError("known_contexts.json has no known_contexts")
+    return sorted(known)
+
+
+def load_routes(routes_file=ROUTES_FILE):
+    data = _read_json(routes_file)
+    raw = data.get("routes") if isinstance(data, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raise RouterError("routing.json has no routes")
+    routes = []
+    for entry in raw:
+        if not isinstance(entry, dict) or not entry.get("jurisdiction") or not entry.get("context"):
+            raise RouterError("every route needs a jurisdiction and a context")
+        routes.append({
+            "jurisdiction": _norm(entry["jurisdiction"]),
+            "sector": _norm(entry.get("sector")),
+            "context": entry["context"],
+        })
+    return routes
+
+
+def resolve(jurisdiction, sector=None, routes_file=ROUTES_FILE, known_file=KNOWN_CONTEXTS_FILE):
+    """Return the context name for a deployment, or raise RouterError."""
+    j, s = _norm(jurisdiction), _norm(sector)
+    if not j:
+        raise RouterError("no jurisdiction supplied")
+    label = "jurisdiction '" + j + "', sector '" + (s or "(none)") + "'"
+    matches = [r for r in load_routes(routes_file) if r["jurisdiction"] == j and r["sector"] == s]
+    if not matches:
+        raise RouterError("no route for " + label)
+    if len(matches) > 1:
+        raise RouterError("ambiguous routes for " + label)
+    context = matches[0]["context"]
+    if context not in known_contexts(known_file):
+        raise RouterError("route for " + label + " points to unknown context '" + context + "'")
+    return context
+
+
+def load_control_sets(control_sets_file=CONTROL_SETS_FILE):
+    data = _read_json(control_sets_file)
+    sets = data.get("control_sets") if isinstance(data, dict) else None
+    if not isinstance(sets, dict) or not sets:
+        raise RouterError("control_sets.json has no control_sets")
+    return sets
+
+
+def controls_for(context, control_sets_file=CONTROL_SETS_FILE):
+    """Control IDs enabled for a context. Fails closed on a missing or malformed set."""
+    controls = load_control_sets(control_sets_file).get(context)
+    valid = (
+        isinstance(controls, list)
+        and controls
+        and all(isinstance(c, str) and c for c in controls)
+        and len(set(controls)) == len(controls)
+    )
+    if not valid:
+        raise RouterError("no valid control set for context '" + str(context) + "'")
+    return list(controls)
+
+
+def context_json(context):
+    """Exact text of a context data file."""
+    return json.dumps({"context": context}, separators=(",", ":")) + "\n"
+
+
+def write_context_file(context, out_dir=CONTEXT_DIR, known_file=KNOWN_CONTEXTS_FILE):
+    if context not in known_contexts(known_file):
+        raise RouterError("unknown context '" + str(context) + "'")
+    path = Path(out_dir) / (context + ".json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(context_json(context), encoding="utf-8", newline="\n")
+    return path
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Resolve a deployment to a SCOF context")
+    ap.add_argument("--jurisdiction")
+    ap.add_argument("--sector")
+    ap.add_argument("--write", action="store_true", help="also write contexts/<context>.json")
+    ap.add_argument("--list", action="store_true", help="list the configured routes")
+    ap.add_argument("--controls", action="store_true", help="also print the controls enabled for the context")
+    args = ap.parse_args(argv)
+    try:
+        if args.list:
+            for r in load_routes():
+                print(r["jurisdiction"] + " / " + (r["sector"] or "(none)") + " -> " + r["context"])
+            return 0
+        context = resolve(args.jurisdiction, args.sector)
+        if args.write:
+            write_context_file(context)
+        print(context)
+        if args.controls:
+            print("controls: " + ", ".join(controls_for(context)))
+        return 0
+    except RouterError as exc:
+        print("SCOF router error: " + str(exc), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

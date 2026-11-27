@@ -1,0 +1,92 @@
+name: compliance-gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TERRAFORM_VERSION: "1.16.4"
+  OPA_VERSION: "1.21.1"
+  CONFTEST_VERSION: "0.71.0"
+  PYTHON_VERSION: "3.14"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  CHECKPOINT_DISABLE: "1"
+
+jobs:
+  tests:
+    name: Policy and tool tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: open-policy-agent/setup-opa@v2.4.0
+        with:
+          version: ${{ env.OPA_VERSION }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Rego check, format and unit tests
+        run: |
+          set -euo pipefail
+          opa version
+          opa check policies
+          opa fmt --list --fail policies
+          opa test policies
+      - name: Python tests (shared consumer, contract guard, router)
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s cli/compliance-linter -p "test_*.py" -v
+          python -m unittest discover -s router/policy-routing -p "test_*.py" -v
+      - name: Control catalogue hash and matrix text
+        run: python scripts/verify_control_catalogue_hash.py
+
+  gate:
+    name: Compliance gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: open-policy-agent/setup-opa@v2.4.0
+        with:
+          version: ${{ env.OPA_VERSION }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Conftest (checksum verified)
+        run: |
+          set -euo pipefail
+          archive="conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+          base="https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}"
+          curl -sSfLO "${base}/${archive}"
+          curl -sSfLO "${base}/checksums.txt"
+          line=$(awk -v f="${archive}" '$2 == f' checksums.txt); test -n "$line"; echo "$line" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "${archive}" -C "$HOME/.local/bin" conftest
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          rm -f "${archive}" checksums.txt
+      - name: Tool versions
+        run: |
+          terraform version
+          opa version
+          conftest --version
+          python --version
+      - name: Evaluate deployable Terraform configurations
+        run: python scripts/ci_gate.py --engine both --out ci-results/gate_summary.json
+      - name: Upload gate summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-summary
+          path: ci-results/
+          if-no-files-found: ignore
